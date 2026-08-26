@@ -11,21 +11,31 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Cloud anchors for users are always 'User_' followed by a UUID4.
+$CloudAnchorPattern = '^User_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
+if ($CloudAnchor -cnotmatch $CloudAnchorPattern) {
+    throw "CloudAnchor '$CloudAnchor' is not valid. Expected the form 'User_<UUID4>', for example 'User_1e0c1b1a-2f3d-4a5b-8c6d-7e8f9a0b1c2d'."
+}
+
 $EndpointUrl = 'https://adminwebservice.microsoftonline.com/provisioningservice.svc'
 $Action = 'http://schemas.microsoft.com/online/aws/change/2010/01/IProvisioningWebService/Provision'
 
-$ApplicationId = '1651564e-7ce4-4d99-88be-0a65050d8dc3'
+$ApplicationId = '1651564e-7ce4-4d99-88be-0a65050d8dc3' # Can also use 6eb59a73-39b2-4c23-a70f-e2e3ce8965b1
+$TenantId = '00000000-0000-0000-0000-000000000000'
+
 $ClientVersion = '8.0'
 $ProtocolVersion = '2.0'
-$BuildNumber = '2.6.3.0'
 $LanguageId = 'en-US'
 $IsInstalledOnDC = 'True'
 $IssueDateTime = '0001-01-01T00:00:00'
-$TrackingId = [Guid]::NewGuid().ToString()
 
 $ChangedProperties = @(
     'AccountEnabled'
 )
+
+$TrackingId = [Guid]::NewGuid().ToString()
+$ProvisioningScenario = 'export-Delta-AdHoc'
+$ProvisioningSessionDescription = 'manual-old-provision'
 
 function Initialize-WcfBinarySupport {
     if ($PSVersionTable.PSEdition -ne 'Desktop') {
@@ -70,7 +80,7 @@ function Write-ElementString {
     $Writer.WriteEndElement()
 }
 
-function New-ProvisionSoapXml {
+function New-OldProvisionSoapXml {
     param(
         [Parameter(Mandatory = $true)]
         [string] $RequestTrackingId
@@ -109,8 +119,6 @@ function New-ProvisionSoapXml {
         Write-ElementString -Writer $writer -LocalName 'ApplicationId' -Namespace $nsChange -Value $ApplicationId
         Write-ElementString -Writer $writer -LocalName 'BearerToken' -Namespace $nsChange -Value $BearerToken
         Write-ElementString -Writer $writer -LocalName 'ClientVersion' -Namespace $nsChange -Value $ClientVersion
-        Write-ElementString -Writer $writer -LocalName 'DirSyncBuildNumber' -Namespace $nsChange -Value $BuildNumber
-        Write-ElementString -Writer $writer -LocalName 'PIMBuildNumber' -Namespace $nsChange -Value $BuildNumber
         Write-ElementString -Writer $writer -LocalName 'IsInstalledOnDC' -Namespace $nsChange -Value $IsInstalledOnDC
         Write-ElementString -Writer $writer -LocalName 'IssueDateTime' -Namespace $nsChange -Value $IssueDateTime
         Write-ElementString -Writer $writer -LocalName 'LanguageId' -Namespace $nsChange -Value $LanguageId
@@ -258,7 +266,7 @@ function Convert-ResponseBytesToText {
     return [System.Text.Encoding]::UTF8.GetString($Bytes)
 }
 
-function Invoke-ProvisionRequest {
+function Invoke-OldProvisionRequest {
     param(
         [Parameter(Mandatory = $true)]
         [byte[]] $Payload
@@ -277,8 +285,10 @@ function Invoke-ProvisionRequest {
     $request.Headers['x-ms-aadmsods-appid'] = $ApplicationId
     $request.Headers['client-request-id'] = $TrackingId
     $request.Headers['x-ms-aadmsods-clientversion'] = $ClientVersion
-    $request.Headers['x-ms-aadmsods-tenantid'] = '00000000-0000-0000-0000-000000000000'
-    $request.Headers['x-ms-aadmsods-machineid'] = '00000000-0000-0000-0000-000000000000'
+    $request.Headers['x-ms-aadmsods-tenantid'] = $TenantId
+    $request.Headers['x-ms-aadmsods-machineid'] = 'not-available'
+    $request.Headers['x-ms-aadmsods-scenario'] = $ProvisioningScenario
+    $request.Headers['x-ms-aadmsods-provisioningsessiondesc'] = $ProvisioningSessionDescription
 
     $requestStream = $request.GetRequestStream()
     try {
@@ -339,11 +349,15 @@ catch {
 }
 [System.Net.ServicePointManager]::SecurityProtocol = $securityProtocol
 
-$soapXml = New-ProvisionSoapXml -RequestTrackingId $TrackingId
+$soapXml = New-OldProvisionSoapXml -RequestTrackingId $TrackingId
 $payload = ConvertTo-WcfBinarySoap -SoapXml $soapXml
 
-$result = Invoke-ProvisionRequest -Payload $payload
+$result = Invoke-OldProvisionRequest -Payload $payload
 
-if ($result.StatusCode -eq 200){
+if ($result.Body -like '*<ResultCode>Success*') {
     Write-Host ("{0} has been disabled." -f $CloudAnchor)
+}
+else {
+    Write-Host 'User not disabled successfully. An error happened. Here is the response body:'
+    Write-Host $result.Body
 }

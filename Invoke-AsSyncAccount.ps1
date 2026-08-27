@@ -20,14 +20,13 @@
 
 [CmdletBinding()]
 param(
-    # The gMSA the ADSync service runs as. Find it with:
-    #   (Get-CimInstance Win32_Service -Filter "Name='ADSync'").StartName
-    [Parameter(Mandatory = $true)]
+    # The gMSA the ADSync service runs as. When omitted, it is discovered from
+    # local sources (the ADSync service account and matching user profiles).
     [ValidateNotNullOrEmpty()]
     [string] $GmsaAccount,
 
     # Command line executed as the gMSA. Defaults to whoami.
-    [string] $Command = 'whoami /all',
+    [string] $Command = 'Get-ChildItem Cert:\CurrentUser -Recurse',
 
     # How long to wait for the one-shot task to finish.
     [ValidateRange(5, 600)]
@@ -45,7 +44,57 @@ function Assert-Elevated {
     }
 }
 
+function Resolve-GmsaAccount {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Pattern
+    )
+
+    # A gMSA is a domain account, not a local user, so it is not in Get-LocalUser.
+    # It does leave two local footprints we can match: the account the ADSync
+    # service runs as, and the profile directory it created under C:\Users.
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    # 1. Most authoritative - already qualified as DOMAIN\name$.
+    $service = Get-CimInstance Win32_Service -Filter "Name='ADSync'" -ErrorAction SilentlyContinue
+    if ($service -and $service.StartName) {
+        $leaf = ($service.StartName -split '\\')[-1]
+        if ($leaf -like $Pattern) {
+            $candidates.Add($service.StartName)
+        }
+    }
+
+    # 2. Profile directories, qualified with this machine's domain so they match
+    #    the form New-ScheduledTaskPrincipal needs.
+    Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like $Pattern } |
+        ForEach-Object { $candidates.Add("$env:USERDOMAIN\$($_.Name)") }
+
+    $unique = @($candidates | Sort-Object -Unique)
+
+    if ($unique.Count -eq 0) {
+        throw (@(
+            "Could not find a gMSA matching '$Pattern' from the ADSync service account or C:\Users profiles.",
+            "Check the ADSync service account with:",
+            "  (Get-CimInstance Win32_Service -Filter `"Name='ADSync'`").StartName",
+            "then pass it explicitly with -GmsaAccount."
+        ) -join [Environment]::NewLine)
+    }
+
+    if ($unique.Count -gt 1) {
+        throw ("Found multiple accounts matching '$Pattern': {0}. Disambiguate with -GmsaAccount." -f ($unique -join ', '))
+    }
+
+    return $unique[0]
+}
+
 Assert-Elevated
+
+if ([string]::IsNullOrWhiteSpace($GmsaAccount)) {
+    [string] $AccountPattern = 'ADSync*$'
+    $GmsaAccount = Resolve-GmsaAccount -Pattern $AccountPattern
+    Write-Verbose "Discovered gMSA account: $GmsaAccount"
+}
 
 # Unique task name plus a scratch directory the task writes its output to. It
 # lives under ProgramData (not the admin's TEMP, which the gMSA cannot write to)
@@ -68,6 +117,8 @@ if ($LASTEXITCODE -ne 0) {
 # is split out with a separate inner redirect.
 $innerCommand = "try { & { $Command } 1> '$outputFile' 2> '$errorFile' } catch { `$_ | Out-File -FilePath '$errorFile' -Append; exit 1 }"
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($innerCommand))
+
+Write-Verbose "Running as gMSA: $GmsaAccount"
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $encoded"

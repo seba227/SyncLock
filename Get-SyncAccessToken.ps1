@@ -1,22 +1,18 @@
 <#
 .SYNOPSIS
-    End-to-end: mints an Entra ID access token for the Entra Connect Sync service
-    principal, using the sync identity certificate that only the gMSA can reach.
+    Fetch an Entra ID access token for the Sync API using the sync app registration certificate.
 
 .DESCRIPTION
-    Self-contained single-file version of the SyncLock flow. In one run it:
+    Script to fetch a Sync Service Principal (ConnectSyncProvisioning_*) Bearer Token.
 
-      1. Discovers the ADSync gMSA and, via a one-shot scheduled task, runs a
-         signing block AS that account (a local admin cannot make CurrentUser
-         resolve to the gMSA, but can launch a process as it).
-      2. Inside the gMSA context, locates the sync identity certificate, builds a
-         client assertion (private_key_jwt) and signs it with the private key -
-         PS256 / 'x5t#S256', matching Entra's own sync assertion.
-      3. POSTs the assertion to the tenant token endpoint (client_credentials)
-         and returns the access token.
+    !!! To be ran as local admin !!!
 
-    Must be run elevated, on the Entra Connect Sync server (an authorized host
-    for the gMSA). Everything except the tenant and client id is fixed below.
+    It does the following:
+
+    1. Dynamically discover the local gMSA account name.
+    2. Use Scheduled Tasks to run as the gMSA account.
+    3. Create client assertion using the Entra Connect certificate under the gMSA account.
+    4. Use the client assertion to fetch Bearer Token.
 
 .EXAMPLE
     .\Get-SyncAccessToken.ps1 -TenantId 'contoso.onmicrosoft.com' -ClientId '<sync-sp-appid>'
@@ -29,8 +25,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $TenantId,
 
-    # AppId of the per-tenant Entra Connect Sync service principal. Also the
-    # assertion's iss/sub.
+    # AppId of the per-tenant Entra Connect Sync service principal. Also the assertion's iss/sub.
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string] $ClientId
@@ -40,7 +35,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # -------------------------------------------------------------------------
-# Fixed configuration (previously the tunable parameters).
+# Configuration
 # -------------------------------------------------------------------------
 $CertificateSubject       = 'CN=Entra Connect Sync Provisioning'
 $AssertionLifetimeMinutes = 10
@@ -50,7 +45,7 @@ $ClientAssertionType      = 'urn:ietf:params:oauth:client-assertion-type:jwt-bea
 $tokenEndpoint            = 'https://login.microsoftonline.com/{0}/oauth2/v2.0/token' -f $TenantId
 
 # =========================================================================
-# Run-as-gMSA machinery (inlined from Invoke-AsSyncAccount.ps1)
+# Run-as-gMSA machinery
 # =========================================================================
 
 function Assert-Elevated {
@@ -64,9 +59,6 @@ function Assert-Elevated {
 function Resolve-GmsaAccount {
     param([Parameter(Mandatory = $true)] [string] $Pattern)
 
-    # A gMSA is a domain account, not a local user, so it is not in Get-LocalUser.
-    # It does leave two local footprints we can match: the account the ADSync
-    # service runs as, and the profile directory it created under C:\Users.
     $candidates = New-Object System.Collections.Generic.List[string]
 
     $service = Get-CimInstance Win32_Service -Filter "Name='ADSync'" -ErrorAction SilentlyContinue
@@ -170,7 +162,7 @@ function Invoke-AsGmsa {
 }
 
 # =========================================================================
-# Token machinery (inlined from New-SyncClientAssertion.ps1)
+# Token machinery
 # =========================================================================
 
 function Get-WebExceptionBody {
@@ -193,9 +185,6 @@ function Request-AccessToken {
         [Parameter(Mandatory = $true)] [string] $Assertion
     )
 
-    # Build the body by hand so the wire format is exactly:
-    #   client_id=...&client_assertion_type=...&client_assertion=...&scope=...&grant_type=client_credentials
-    # EscapeDataString gives the '%2F' / '%3A' encoding the endpoint expects.
     $fields = [ordered] @{
         client_id             = $ClientId
         client_assertion_type = $ClientAssertionType
@@ -217,9 +206,9 @@ function Request-AccessToken {
 }
 
 # -------------------------------------------------------------------------
-# The signing block, executed inside the gMSA context. Single-quoted here-string
-# so nothing expands here; config values are substituted below. It prints a
-# one-line JSON object (assertion + exp + cert identity) to stdout.
+# The signing block used to create the client assertion, executed inside the gMSA context.
+# Single-quoted string so nothing expands here; config values are substituted below.
+# It prints a one-line JSON object (assertion + exp + cert identity) to stdout.
 # -------------------------------------------------------------------------
 $signingTemplate = @'
 $ErrorActionPreference = 'Stop'
@@ -312,6 +301,7 @@ finally {
 
 Assert-Elevated
 
+# It looks like the Entra Connect gMSA accounts have the structure: ADSync********$
 $gmsaAccount = Resolve-GmsaAccount -Pattern 'ADSync*$'
 Write-Verbose "Discovered gMSA account: $gmsaAccount"
 
@@ -349,19 +339,21 @@ catch {
 Write-Verbose "Redeeming the assertion for an access token at $tokenEndpoint"
 $response = Request-AccessToken -TokenEndpoint $tokenEndpoint -Assertion $signed.assertion
 
-$tokenExpiresOnUtc = $null
-if ($null -ne $response.expires_in) {
-    $tokenExpiresOnUtc = [DateTimeOffset]::UtcNow.AddSeconds([int] $response.expires_in).UtcDateTime
-}
+# $tokenExpiresOnUtc = $null
+# if ($null -ne $response.expires_in) {
+#     $tokenExpiresOnUtc = [DateTimeOffset]::UtcNow.AddSeconds([int] $response.expires_in).UtcDateTime
+# }
 
-[pscustomobject] @{
-    AccessToken       = $response.access_token
-    TokenType         = $response.token_type
-    TokenExpiresOnUtc = $tokenExpiresOnUtc
-    Scope             = $Scope
-    ClientId          = $ClientId
-    TokenEndpoint     = $tokenEndpoint
-    Thumbprint        = $signed.thumbprint
-    Subject           = $signed.subject
-    RanAs             = $gmsaAccount
-}
+# [pscustomobject] @{
+#     AccessToken       = $response.access_token
+#     TokenType         = $response.token_type
+#     TokenExpiresOnUtc = $tokenExpiresOnUtc
+#     Scope             = $Scope
+#     ClientId          = $ClientId
+#     TokenEndpoint     = $tokenEndpoint
+#     Thumbprint        = $signed.thumbprint
+#     Subject           = $signed.subject
+#     RanAs             = $gmsaAccount
+# }
+
+$response.access_token

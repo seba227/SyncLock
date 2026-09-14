@@ -358,6 +358,6 @@ if ($result.Body -like '*<ResultCode>Success*') {
     Write-Host ("{0} has been disabled." -f $CloudAnchor)
 }
 else {
-    Write-Host 'User not disabled successfully. An error happened. Here is the response body:'
+    Write-Host 'Disabling user failed. Response body:'
     Write-Host $result.Body
 }

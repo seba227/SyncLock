@@ -339,21 +339,4 @@ catch {
 Write-Verbose "Redeeming the assertion for an access token at $tokenEndpoint"
 $response = Request-AccessToken -TokenEndpoint $tokenEndpoint -Assertion $signed.assertion
 
-# $tokenExpiresOnUtc = $null
-# if ($null -ne $response.expires_in) {
-#     $tokenExpiresOnUtc = [DateTimeOffset]::UtcNow.AddSeconds([int] $response.expires_in).UtcDateTime
-# }
-
-# [pscustomobject] @{
-#     AccessToken       = $response.access_token
-#     TokenType         = $response.token_type
-#     TokenExpiresOnUtc = $tokenExpiresOnUtc
-#     Scope             = $Scope
-#     ClientId          = $ClientId
-#     TokenEndpoint     = $tokenEndpoint
-#     Thumbprint        = $signed.thumbprint
-#     Subject           = $signed.subject
-#     RanAs             = $gmsaAccount
-# }
-
 $response.access_token

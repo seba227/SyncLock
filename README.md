@@ -28,6 +28,12 @@ Usage:
 .\Get-SyncAccessToken.ps1 -TenantId 'contoso.onmicrosoft.com' -ClientId '<sync-sp-appid>'
 ```
 
+You can get the AppID of the Sync Service Principal by running:
+
+```
+Get-ADSyncEntraConnectorCredential
+```
+
 Parameters:
 - `TenantId`: TenantId of the target tenant. Can be either the UUID4 or the primary domain.
 - `ClientId`: Application ID of the Sync Service Principal. Look for the SP whose name starts with `ConnectSyncProvisioning_*`.

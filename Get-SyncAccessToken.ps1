@@ -9,9 +9,10 @@
 
     It does the following:
 
-    1. Dynamically discover the local gMSA account name.
-    2. Use Scheduled Tasks to run as the gMSA account.
-    3. Create client assertion using the Entra Connect certificate under the gMSA account.
+    1. Dynamically discover the local gMSA account name, falling back to the
+       virtual service account 'NT SERVICE\ADSync' when no gMSA is installed.
+    2. Use Scheduled Tasks to run as that sync account.
+    3. Create client assertion using the Entra Connect certificate under the sync account.
     4. Use the client assertion to fetch Bearer Token.
 
 .EXAMPLE
@@ -45,7 +46,7 @@ $ClientAssertionType      = 'urn:ietf:params:oauth:client-assertion-type:jwt-bea
 $tokenEndpoint            = 'https://login.microsoftonline.com/{0}/oauth2/v2.0/token' -f $TenantId
 
 # =========================================================================
-# Run-as-gMSA machinery
+# Run-as-sync-account machinery
 # =========================================================================
 
 function Assert-Elevated {
@@ -73,37 +74,53 @@ function Resolve-GmsaAccount {
 
     $unique = @($candidates | Sort-Object -Unique)
 
-    if ($unique.Count -eq 0) {
-        throw (@(
-            "Could not find a gMSA matching '$Pattern' from the ADSync service account or C:\Users profiles.",
-            "Check the ADSync service account with:",
-            "  (Get-CimInstance Win32_Service -Filter `"Name='ADSync'`").StartName"
-        ) -join [Environment]::NewLine)
-    }
+    # Finding nothing is not fatal here - the caller falls back to the virtual
+    # service account. Ambiguity still is: we cannot guess which gMSA holds the
+    # sync identity certificate.
     if ($unique.Count -gt 1) {
         throw ("Found multiple accounts matching '$Pattern': {0}." -f ($unique -join ', '))
     }
+    if ($unique.Count -eq 0) { return $null }
     return $unique[0]
 }
 
-function Invoke-AsGmsa {
+function Resolve-VirtualServiceAccount {
+    # Not every Entra Connect install uses a gMSA; some run the ADSync service
+    # under the virtual service account 'NT SERVICE\ADSync' instead.
+    $service = Get-CimInstance Win32_Service -Filter "Name='ADSync'" -ErrorAction SilentlyContinue
+    if (-not $service) {
+        throw (@(
+            "Found no gMSA matching 'ADSync*$' and the ADSync service is not installed on this host,",
+            'so there is no sync identity to run as. Run this on the Entra Connect server.'
+        ) -join [Environment]::NewLine)
+    }
+
+    # Prefer whatever the service is actually configured with when that is an
+    # NT SERVICE account, otherwise use the default virtual account name.
+    if ($service.StartName -and $service.StartName -like 'NT SERVICE\*') {
+        return $service.StartName
+    }
+    return 'NT SERVICE\ADSync'
+}
+
+function Invoke-AsSyncAccount {
     param(
-        [Parameter(Mandatory = $true)] [string] $GmsaAccount,
+        [Parameter(Mandatory = $true)] [string] $Account,
         [Parameter(Mandatory = $true)] [string] $Command
     )
 
     # Unique task name plus a scratch directory the task writes its output to. It
-    # lives under ProgramData (not the admin's TEMP, which the gMSA cannot write
-    # to) and is explicitly granted to the gMSA.
+    # lives under ProgramData (not the admin's TEMP, which the run-as account
+    # cannot write to) and is explicitly granted to that account.
     $taskName = "SyncLock_Token_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
     $workDir = Join-Path $env:ProgramData "SyncLock\$taskName"
     $outputFile = Join-Path $workDir 'out.txt'
     $errorFile = Join-Path $workDir 'err.txt'
 
     New-Item -ItemType Directory -Path $workDir -Force | Out-Null
-    & icacls.exe $workDir /grant "$($GmsaAccount):(OI)(CI)M" | Out-Null
+    & icacls.exe $workDir /grant "$($Account):(OI)(CI)M" | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "Could not grant '$GmsaAccount' write access to '$workDir' (icacls exit $LASTEXITCODE)."
+        throw "Could not grant '$Account' write access to '$workDir' (icacls exit $LASTEXITCODE)."
     }
 
     # '*>' redirects every stream including stderr, so stderr is split out with a
@@ -114,15 +131,23 @@ function Invoke-AsGmsa {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
         -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $encoded"
 
-    # gMSA principal: -LogonType Password, no password. The host fetches it from AD.
-    $principal = New-ScheduledTaskPrincipal -UserId $GmsaAccount -LogonType Password -RunLevel Highest
+    # gMSA principal: -LogonType Password with no password, the host fetches it
+    # from AD. Virtual service accounts (NT SERVICE\*) have no password at all
+    # and must be registered with -LogonType ServiceAccount instead.
+    $logonType = if ($Account -like 'NT SERVICE\*' -or $Account -like 'NT AUTHORITY\*') {
+        'ServiceAccount'
+    }
+    else {
+        'Password'
+    }
+    $principal = New-ScheduledTaskPrincipal -UserId $Account -LogonType $logonType -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -ExecutionTimeLimit (New-TimeSpan -Seconds $TimeoutSeconds)
 
     $registered = $false
     try {
         Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal `
-            -Settings $settings -Description 'SyncLock token flow (run as gMSA)' | Out-Null
+            -Settings $settings -Description "SyncLock token flow (run as $Account)" | Out-Null
         $registered = $true
 
         Start-ScheduledTask -TaskName $taskName
@@ -139,7 +164,7 @@ function Invoke-AsGmsa {
         } while ($pending -and (Get-Date) -lt $deadline)
 
         if ($pending) {
-            throw "gMSA task '$taskName' did not finish within $TimeoutSeconds seconds (LastResult 0x$('{0:X8}' -f $info.LastTaskResult))."
+            throw "Task '$taskName' (running as $Account) did not finish within $TimeoutSeconds seconds (LastResult 0x$('{0:X8}' -f $info.LastTaskResult))."
         }
 
         # Get-Content -Raw returns $null for an empty file, so coalesce.
@@ -206,7 +231,7 @@ function Request-AccessToken {
 }
 
 # -------------------------------------------------------------------------
-# The signing block used to create the client assertion, executed inside the gMSA context.
+# The signing block used to create the client assertion, executed inside the sync account's context.
 # Single-quoted string so nothing expands here; config values are substituted below.
 # It prints a one-line JSON object (assertion + exp + cert identity) to stdout.
 # -------------------------------------------------------------------------
@@ -226,7 +251,7 @@ function ConvertTo-Base64UrlJson($Object) {
 }
 
 # The sync identity certificate is not reliably in \My, so sweep every store
-# name in the gMSA's CurrentUser location.
+# name in the run-as account's CurrentUser location.
 $matched = New-Object System.Collections.Generic.List[object]
 foreach ($name in [Enum]::GetNames([System.Security.Cryptography.X509Certificates.StoreName])) {
     $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($name, 'CurrentUser')
@@ -302,8 +327,14 @@ finally {
 Assert-Elevated
 
 # It looks like the Entra Connect gMSA accounts have the structure: ADSync********$
-$gmsaAccount = Resolve-GmsaAccount -Pattern 'ADSync*$'
-Write-Verbose "Discovered gMSA account: $gmsaAccount"
+$syncAccount = Resolve-GmsaAccount -Pattern 'ADSync*$'
+if ($syncAccount) {
+    Write-Verbose "Discovered gMSA account: $syncAccount"
+}
+else {
+    $syncAccount = Resolve-VirtualServiceAccount
+    Write-Verbose "No gMSA found; falling back to the virtual service account: $syncAccount"
+}
 
 $signingScript = $signingTemplate.
     Replace('__CLIENTID__',    $ClientId.Replace("'", "''")).
@@ -311,19 +342,19 @@ $signingScript = $signingTemplate.
     Replace('__CERTSUBJECT__', $CertificateSubject.Replace("'", "''")).
     Replace('__LIFETIME__',    [string] $AssertionLifetimeMinutes)
 
-Write-Verbose "Signing the client assertion as $gmsaAccount"
-$run = Invoke-AsGmsa -GmsaAccount $gmsaAccount -Command $signingScript
+Write-Verbose "Signing the client assertion as $syncAccount"
+$run = Invoke-AsSyncAccount -Account $syncAccount -Command $signingScript
 
 if ([string]::IsNullOrWhiteSpace($run.Output)) {
     $detail = if (-not [string]::IsNullOrWhiteSpace($run.Errors)) { $run.Errors } else { 'no output' }
-    throw "The gMSA signing task produced no assertion. $detail"
+    throw "The signing task running as $syncAccount produced no assertion. $detail"
 }
 
 try {
     $signed = $run.Output | ConvertFrom-Json
 }
 catch {
-    throw "Could not parse the gMSA output as JSON. Raw output:`n$($run.Output)`nErrors:`n$($run.Errors)"
+    throw "Could not parse the $syncAccount output as JSON. Raw output:`n$($run.Output)`nErrors:`n$($run.Errors)"
 }
 
 # TLS 1.2/1.3 for the token POST (older .NET Framework defaults are too low).
